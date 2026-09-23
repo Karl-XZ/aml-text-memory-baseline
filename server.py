@@ -271,7 +271,7 @@ def search_spans(db_path: Path, payload: dict, radius: int = 2,
                  include_source_ids: bool = False) -> dict:
     """Expand lexical hits into ranked source spans, without generating answers."""
     validate_search(payload)
-    candidates = search(db_path, {**payload, "top_k": max(payload["top_k"], 100)})["data"]
+    candidates = search(db_path, {**payload, "top_k": max(payload["top_k"] * 3, 300)})["data"]
     if not candidates:
         return {"data": []}
     with closing(open_db(db_path)) as db:

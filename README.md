@@ -37,4 +37,6 @@ The implementation was written for this entry and does not copy an existing memo
 
 Five local contract tests pass. A separate local 100-question test on the independently public upstream LoCoMo dataset yielded approximately 43% semantic answer correctness for the baseline and 42% for the multilingual/neighbor Search variant, using a nonofficial DeepSeek answer and judge. Source-span retrieval improves cited-evidence coverage in offline tests, but no new end-to-end answer score is available for it. This is **not an official AML score** and is not directly comparable with the Cycle 2 leaderboard. An AML Smoke and Full run have not yet been performed.
 
+In a separate offline source-citation diagnostic, the span mode with Top 100 covered all annotated source turns in 91 of 99 evaluable questions from the same fixed 100-question selection. That diagnostic imported publicly supplied image captions and search-query text alongside each LoCoMo turn; the official AML input may differ. High citation coverage does not establish answer correctness, and returning 100 spans increases the context substantially.
+
 Official evaluation data received through Add or Search must be used only for that evaluation and deleted within 30 days after the run, in accordance with the [official documentation](https://agentmemoryleaderboard.ai/docs).
