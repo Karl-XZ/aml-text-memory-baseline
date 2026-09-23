@@ -146,7 +146,10 @@ def add(db_path: Path, payload: dict) -> dict:
                 stamp = message.get("timestamp")
                 when = datetime.fromtimestamp(stamp / 1000, timezone.utc) if stamp is not None else datetime.now(timezone.utc)
                 created_at = when.isoformat().replace("+00:00", "Z")
-                content = f"[{created_at}] {message['role']}: {message['content']}"
+                # A persistence timestamp is not the source event time. Only put a
+                # date in the evidence text when Add supplied a source timestamp.
+                prefix = f"[{created_at}] " if stamp is not None else ""
+                content = f"{prefix}{message['role']}: {message['content']}"
                 item_id = memory_id(request_id, index)
                 db.execute(
                     "INSERT INTO memories VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -264,7 +267,70 @@ def search(db_path: Path, payload: dict, neighbor_weight: float = 0.35) -> dict:
     ]}
 
 
-def make_server(host: str, port: int, db_path: Path, api_key: str = "") -> ThreadingHTTPServer:
+def search_spans(db_path: Path, payload: dict, radius: int = 2,
+                 include_source_ids: bool = False) -> dict:
+    """Expand lexical hits into ranked source spans, without generating answers."""
+    validate_search(payload)
+    candidates = search(db_path, {**payload, "top_k": max(payload["top_k"], 100)})["data"]
+    if not candidates:
+        return {"data": []}
+    with closing(open_db(db_path)) as db:
+        ids = [item["id"] for item in candidates]
+        centers = {}
+        for start in range(0, len(ids), 500):
+            chunk = ids[start:start + 500]
+            marks = ",".join("?" for _ in chunk)
+            for row in db.execute(
+                f"SELECT rowid AS position, id, session_id FROM memories "
+                f"WHERE user_id=? AND id IN ({marks})", (payload["user_id"], *chunk)
+            ):
+                centers[row["id"]] = row
+        positions = sorted({centers[item["id"]]["position"] + offset
+                            for item in candidates if item["id"] in centers
+                            for offset in range(-radius, radius + 1)
+                            if centers[item["id"]]["position"] + offset > 0})
+        surrounding = {}
+        for start in range(0, len(positions), 500):
+            chunk = positions[start:start + 500]
+            marks = ",".join("?" for _ in chunk)
+            for row in db.execute(
+                f"SELECT rowid AS position, id, session_id, content, created_at "
+                f"FROM memories WHERE user_id=? AND rowid IN ({marks})",
+                (payload["user_id"], *chunk),
+            ):
+                surrounding[row["position"]] = row
+    used_centers = set()
+    results = []
+    for candidate in candidates:
+        center = centers.get(candidate["id"])
+        if center is None or candidate["id"] in used_centers:
+            continue
+        span = [surrounding[position]
+                for position in range(center["position"] - radius,
+                                      center["position"] + radius + 1)
+                if position in surrounding
+                and surrounding[position]["session_id"] == center["session_id"]]
+        if not span:
+            continue
+        source_ids = [row["id"] for row in span]
+        used_centers.update(source_ids)
+        span_id = "span_" + hashlib.sha256("\0".join(source_ids).encode()).hexdigest()[:24]
+        result = {"id": span_id,
+                  "content": "\n".join(row["content"] for row in span),
+                  "score": candidate["score"],
+                  "created_at": candidate["created_at"]}
+        if include_source_ids:
+            result["_source_ids"] = source_ids
+        results.append(result)
+        if len(results) >= payload["top_k"]:
+            break
+    return {"data": results}
+
+
+def make_server(host: str, port: int, db_path: Path, api_key: str = "",
+                search_mode: str = "single") -> ThreadingHTTPServer:
+    if search_mode not in ("single", "span"):
+        raise ValueError("search_mode must be single or span")
     initialize(db_path)
 
     class Handler(BaseHTTPRequestHandler):
@@ -305,7 +371,12 @@ def make_server(host: str, port: int, db_path: Path, api_key: str = "") -> Threa
                 if length < 0:
                     raise ContractError("Content-Length is required", 400)
                 payload = json.loads(self.rfile.read(length))
-                result = add(db_path, payload) if path == "/add" else search(db_path, payload)
+                if path == "/add":
+                    result = add(db_path, payload)
+                elif search_mode == "span":
+                    result = search_spans(db_path, payload)
+                else:
+                    result = search(db_path, payload)
                 self.respond(200, result)
             except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as error:
                 self.respond(400, {"error": str(error)})
@@ -320,8 +391,10 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--db", type=Path, default=Path("state/memory.sqlite3"))
+    parser.add_argument("--search-mode", choices=("single", "span"), default="single")
     args = parser.parse_args()
-    server = make_server(args.host, args.port, args.db, os.getenv("MEMORY_SYSTEM_KEY", ""))
+    server = make_server(args.host, args.port, args.db, os.getenv("MEMORY_SYSTEM_KEY", ""),
+                         args.search_mode)
     print(f"listening on http://{args.host}:{server.server_port}; db={args.db}", flush=True)
     try:
         server.serve_forever()

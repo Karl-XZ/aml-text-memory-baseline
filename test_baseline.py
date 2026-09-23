@@ -21,8 +21,8 @@ class BaselineTest(unittest.TestCase):
         self.stop()
         self.directory.cleanup()
 
-    def start(self):
-        self.server = make_server("127.0.0.1", 0, self.db, "local-secret")
+    def start(self, search_mode="single"):
+        self.server = make_server("127.0.0.1", 0, self.db, "local-secret", search_mode)
         self.base = f"http://127.0.0.1:{self.server.server_port}"
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -31,6 +31,27 @@ class BaselineTest(unittest.TestCase):
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=3)
+
+    def test_span_search_preserves_source_and_isolation_after_restart(self):
+        self.stop()
+        self.start("span")
+        self.request("/add", {"request_id": "span-1", "user_id": "alice", "session_id": "s1",
+                              "messages": [
+                                  {"role": "user", "content": "At school I joined the music club."},
+                                  {"role": "assistant", "content": "I chose the violin."},
+                                  {"role": "user", "content": "Practice is on Fridays."},
+                              ]})
+        self.request("/add", {"request_id": "span-2", "user_id": "bob", "session_id": "s1",
+                              "messages": [{"role": "user", "content": "At school I chose the trumpet."}]})
+        query = {"query": "school music club", "user_id": "alice", "top_k": 1}
+        status, before = self.request("/search", query)
+        self.assertEqual(status, 200)
+        self.assertEqual(len(before["data"]), 1)
+        self.assertIn("I chose the violin", before["data"][0]["content"])
+        self.assertNotIn("trumpet", before["data"][0]["content"])
+        self.stop()
+        self.start("span")
+        self.assertEqual(self.request("/search", query), (200, before))
 
     def request(self, path, payload=None, key="Bearer local-secret"):
         headers = {} if payload is None else {"Content-Type": "application/json"}
