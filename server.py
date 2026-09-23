@@ -1,0 +1,335 @@
+"""Local, dependency-free AML Textual Add/Search baseline."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import sqlite3
+from contextlib import closing
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import urlsplit
+
+
+STOPWORDS = frozenset(
+    "a an and are as at be been but by can did do does for from had has have how i "
+    "in is it its me my of on or our the their them there these they this to was "
+    "were what when where which who why with would you your".split()
+)
+
+
+def memory_id(request_id: str, index: int) -> str:
+    digest = hashlib.sha256(f"{request_id}\0{index}".encode("utf-8")).hexdigest()
+    return "mem_" + digest[:24]
+
+
+def open_db(path: Path) -> sqlite3.Connection:
+    connection = sqlite3.connect(path, timeout=30)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA busy_timeout=30000")
+    connection.execute("PRAGMA synchronous=FULL")
+    return connection
+
+
+def initialize(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with closing(open_db(path)) as db:
+        db.executescript(
+            """
+            PRAGMA journal_mode=WAL;
+            CREATE TABLE IF NOT EXISTS requests (
+                request_id TEXT PRIMARY KEY,
+                payload_hash TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                session_id TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS memories (
+                id TEXT PRIMARY KEY,
+                request_id TEXT NOT NULL,
+                message_index INTEGER NOT NULL,
+                user_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(request_id) REFERENCES requests(request_id)
+            );
+            CREATE INDEX IF NOT EXISTS memories_user ON memories(user_id);
+            CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+                id UNINDEXED, content, tokenize='porter unicode61'
+            );
+            CREATE VIRTUAL TABLE IF NOT EXISTS memories_trigram_fts USING fts5(
+                id UNINDEXED, content, tokenize='trigram'
+            );
+            """
+        )
+        # Upgrade databases created before the multilingual index existed.
+        if db.execute("SELECT count(*) FROM memories_trigram_fts").fetchone()[0] == 0:
+            db.execute("INSERT INTO memories_trigram_fts(id, content) SELECT id, content FROM memories")
+            db.commit()
+
+
+class ContractError(Exception):
+    def __init__(self, message: str, status: int = 422):
+        super().__init__(message)
+        self.status = status
+
+
+def require_string(obj: dict, field: str) -> str:
+    value = obj.get(field)
+    if not isinstance(value, str) or not value.strip():
+        raise ContractError(f"{field} must be a non-empty string")
+    return value
+
+
+def validate_add(payload: object) -> dict:
+    if not isinstance(payload, dict):
+        raise ContractError("body must be an object")
+    for field in ("request_id", "user_id", "session_id"):
+        require_string(payload, field)
+    messages = payload.get("messages")
+    if not isinstance(messages, list) or not messages:
+        raise ContractError("messages must be a non-empty array")
+    for i, message in enumerate(messages):
+        if not isinstance(message, dict):
+            raise ContractError(f"messages[{i}] must be an object")
+        if message.get("role") not in ("user", "assistant"):
+            raise ContractError(f"messages[{i}].role must be user or assistant")
+        require_string(message, "content")
+        stamp = message.get("timestamp")
+        if stamp is not None and (type(stamp) not in (int, float) or stamp < 0):
+            raise ContractError(f"messages[{i}].timestamp must be Unix milliseconds")
+    return payload
+
+
+def validate_search(payload: object) -> dict:
+    if not isinstance(payload, dict):
+        raise ContractError("body must be an object")
+    require_string(payload, "query")
+    require_string(payload, "user_id")
+    top_k = payload.get("top_k")
+    if type(top_k) is not int or top_k < 1:
+        raise ContractError("top_k must be a positive integer")
+    options = payload.get("options")
+    if options is not None and (
+        not isinstance(options, list)
+        or any(not isinstance(option, str) for option in options)
+    ):
+        raise ContractError("options must be an array of strings")
+    return payload
+
+
+def add(db_path: Path, payload: dict) -> dict:
+    payload = validate_add(payload)
+    request_id = payload["request_id"]
+    user_id = payload["user_id"]
+    session_id = payload["session_id"]
+    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    payload_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    with closing(open_db(db_path)) as db:
+        db.execute("BEGIN IMMEDIATE")
+        previous = db.execute(
+            "SELECT payload_hash FROM requests WHERE request_id=?", (request_id,)
+        ).fetchone()
+        if previous:
+            if previous["payload_hash"] != payload_hash:
+                raise ContractError("request_id already used with different payload", 409)
+        else:
+            db.execute(
+                "INSERT INTO requests VALUES (?, ?, ?, ?)",
+                (request_id, payload_hash, user_id, session_id),
+            )
+            for index, message in enumerate(payload["messages"]):
+                stamp = message.get("timestamp")
+                when = datetime.fromtimestamp(stamp / 1000, timezone.utc) if stamp is not None else datetime.now(timezone.utc)
+                created_at = when.isoformat().replace("+00:00", "Z")
+                content = f"[{created_at}] {message['role']}: {message['content']}"
+                item_id = memory_id(request_id, index)
+                db.execute(
+                    "INSERT INTO memories VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (item_id, request_id, index, user_id, session_id, content, created_at),
+                )
+                db.execute(
+                    "INSERT INTO memories_fts(id, content) VALUES (?, ?)",
+                    (item_id, content),
+                )
+                db.execute(
+                    "INSERT INTO memories_trigram_fts(id, content) VALUES (?, ?)",
+                    (item_id, content),
+                )
+        db.commit()
+    return {"success": True, "request_id": request_id, "user_id": user_id, "session_id": session_id}
+
+
+def fts_query(query: str) -> str:
+    words = re.findall(r"[^\W_]+", query.casefold(), flags=re.UNICODE)
+    terms = list(dict.fromkeys(word for word in words if word not in STOPWORDS))[:64]
+    return " OR ".join('"' + word.replace('"', '""') + '"' for word in terms)
+
+
+def trigram_query(query: str) -> str:
+    """Use overlapping CJK triples so ordinary Chinese questions are searchable."""
+    groups = re.findall(r"[\u3400-\u9fff]+", query)
+    grams = list(dict.fromkeys(group[i:i + 3] for group in groups for i in range(len(group) - 2)))
+    return " OR ".join('"' + gram + '"' for gram in grams[:64])
+
+
+def search_baseline(db_path: Path, payload: dict) -> dict:
+    payload = validate_search(payload)
+    expression = fts_query(payload["query"])
+    if not expression:
+        return {"data": []}
+    with closing(open_db(db_path)) as db:
+        rows = db.execute(
+            """
+            SELECT m.id, m.content, m.created_at, bm25(memories_fts) AS rank
+            FROM memories_fts JOIN memories AS m ON m.id=memories_fts.id
+            WHERE memories_fts MATCH ? AND m.user_id=?
+            ORDER BY rank ASC, m.id ASC LIMIT ?
+            """,
+            (expression, payload["user_id"], payload["top_k"]),
+        ).fetchall()
+    return {
+        "data": [
+            {"id": row["id"], "content": row["content"], "score": float(-row["rank"]), "created_at": row["created_at"]}
+            for row in rows
+        ]
+    }
+
+
+def search(db_path: Path, payload: dict, neighbor_weight: float = 0.35) -> dict:
+    """Fuse lexical hits with nearby turns from the same source session."""
+    payload = validate_search(payload)
+    expression = fts_query(payload["query"])
+    cjk_expression = trigram_query(payload["query"])
+    if not expression and not cjk_expression:
+        return {"data": []}
+    with closing(open_db(db_path)) as db:
+        limit = max(300, payload["top_k"] * 3)
+        rankings = []
+        if expression:
+            rankings.append(db.execute(
+                """
+                SELECT m.rowid AS position, m.id, m.session_id, bm25(memories_fts) AS rank
+                FROM memories_fts JOIN memories AS m ON m.id=memories_fts.id
+                WHERE memories_fts MATCH ? AND m.user_id=?
+                ORDER BY rank ASC, m.id ASC LIMIT ?
+                """, (expression, payload["user_id"], limit),
+            ).fetchall())
+        if cjk_expression:
+            rankings.append(db.execute(
+                """
+                SELECT m.rowid AS position, m.id, m.session_id, bm25(memories_trigram_fts) AS rank
+                FROM memories_trigram_fts JOIN memories AS m ON m.id=memories_trigram_fts.id
+                WHERE memories_trigram_fts MATCH ? AND m.user_id=?
+                ORDER BY rank ASC, m.id ASC LIMIT ?
+                """, (cjk_expression, payload["user_id"], limit),
+            ).fetchall())
+        candidates = [hit for ranking in rankings for hit in ranking]
+        if not candidates:
+            return {"data": []}
+        positions = sorted({hit["position"] + offset for hit in candidates for offset in (-1, 0, 1) if hit["position"] + offset > 0})
+        rows = []
+        for start in range(0, len(positions), 500):
+            batch = positions[start:start + 500]
+            placeholders = ",".join("?" for _ in batch)
+            rows.extend(db.execute(
+                f"SELECT rowid AS position, id, session_id, content, created_at "
+                f"FROM memories WHERE user_id=? AND rowid IN ({placeholders})",
+                (payload["user_id"], *batch),
+            ).fetchall())
+    documents = {row["id"]: row for row in rows}
+    by_position = {row["position"]: row for row in rows}
+    scores = {}
+    lexical_rank = {}
+    for ranking in rankings:
+        for rank, hit in enumerate(ranking, 1):
+            identifier = hit["id"]
+            lexical_rank[identifier] = min(rank, lexical_rank.get(identifier, 10**9))
+            base = 1.0 / (20.0 + rank)
+            scores[identifier] = scores.get(identifier, 0.0) + base
+            for offset in (-1, 1):
+                adjacent = by_position.get(hit["position"] + offset)
+                if adjacent is not None and adjacent["session_id"] == hit["session_id"]:
+                    neighbor = adjacent["id"]
+                    scores[neighbor] = scores.get(neighbor, 0.0) + base * neighbor_weight
+    ordered = sorted(scores, key=lambda identifier: (-scores[identifier], lexical_rank.get(identifier, 10**9), identifier))
+    return {"data": [
+        {"id": identifier, "content": documents[identifier]["content"],
+         "score": scores[identifier], "created_at": documents[identifier]["created_at"]}
+        for identifier in ordered[:payload["top_k"]]
+    ]}
+
+
+def make_server(host: str, port: int, db_path: Path, api_key: str = "") -> ThreadingHTTPServer:
+    initialize(db_path)
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: object) -> None:
+            pass
+
+        def respond(self, status: int, body: dict) -> None:
+            wire = json.dumps(body, ensure_ascii=False).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(wire)))
+            self.end_headers()
+            self.wfile.write(wire)
+
+        def do_GET(self) -> None:
+            if urlsplit(self.path).path == "/health":
+                self.respond(200, {"status": "ok"})
+            else:
+                self.respond(404, {"error": "not found"})
+
+        def do_POST(self) -> None:
+            path = urlsplit(self.path).path
+            if path not in ("/add", "/search"):
+                self.respond(404, {"error": "not found"})
+                return
+            if api_key:
+                supplied = (
+                    self.headers.get("X-Api-Key", ""),
+                    self.headers.get("Authorization", ""),
+                )
+                if api_key not in supplied and not any(
+                    header in (f"Bearer {api_key}", f"Token {api_key}") for header in supplied
+                ):
+                    self.respond(401, {"error": "unauthorized"})
+                    return
+            try:
+                length = int(self.headers.get("Content-Length", "-1"))
+                if length < 0:
+                    raise ContractError("Content-Length is required", 400)
+                payload = json.loads(self.rfile.read(length))
+                result = add(db_path, payload) if path == "/add" else search(db_path, payload)
+                self.respond(200, result)
+            except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as error:
+                self.respond(400, {"error": str(error)})
+            except ContractError as error:
+                self.respond(error.status, {"error": str(error)})
+
+    return ThreadingHTTPServer((host, port), Handler)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--db", type=Path, default=Path("state/memory.sqlite3"))
+    args = parser.parse_args()
+    server = make_server(args.host, args.port, args.db, os.getenv("MEMORY_SYSTEM_KEY", ""))
+    print(f"listening on http://{args.host}:{server.server_port}; db={args.db}", flush=True)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+
+
+if __name__ == "__main__":
+    main()
