@@ -10,7 +10,7 @@ This repository contains a participant-hosted memory service for the Agent Memor
 | `POST /search` | Returns up to `top_k` ranked source memories under the exact `user_id` boundary. Accepts top-level multiple-choice `options`. |
 | `GET /health` | Returns HTTP 200 without authentication. |
 
-Search defaults to individual source turns (`--search-mode single`). The experimental `--search-mode span` returns up to five adjacent source turns from the same `user_id` and session in each ranked result. Each span has a stable ID and contains original source text; Search does not answer the question.
+Search defaults to individual source turns (`--search-mode single`) for local development. The deployed text-memory baseline uses `--search-mode span --span-radius 5`: each ranked result contains the hit and up to five original turns on either side within the same session. Each span has a stable ID and contains original source text; Search does not answer the question.
 
 Set `MEMORY_SYSTEM_KEY` to enable authentication on Add and Search. The service accepts `Authorization: Token`, `Authorization: Bearer`, or `X-Api-Key`. Keep this key outside the repository and submit it only through the official evaluation request form.
 
@@ -20,7 +20,7 @@ Python 3.12 or newer, with SQLite FTS5 enabled, is sufficient. There are no thir
 
 ```sh
 python -m unittest -q test_baseline.py
-python server.py --host 127.0.0.1 --port 8000 --db state/memory.sqlite3 --search-mode span
+python server.py --host 127.0.0.1 --port 8000 --db state/memory.sqlite3 --search-mode span --span-radius 5
 ```
 
 Omit `--search-mode span` to use the original single-turn retrieval.
@@ -35,8 +35,8 @@ The implementation was written for this entry and does not copy an existing memo
 
 ## Result scope
 
-Five local contract tests pass. A separate local 100-question test on the independently public upstream LoCoMo dataset yielded approximately 43% semantic answer correctness for the baseline and 42% for the multilingual/neighbor Search variant, using a nonofficial DeepSeek answer and judge. Source-span retrieval improves cited-evidence coverage in offline tests, but no new end-to-end answer score is available for it. This is **not an official AML score** and is not directly comparable with the Cycle 2 leaderboard. An AML Smoke and Full run have not yet been performed.
+The local API contract tests cover Add, Search, isolation, retries, and persistence. A separate local 100-question experiment on the public upstream LoCoMo dataset using radius-5 raw spans reached **67/100** under a DeepSeek Answer/Judge proxy with the published AML prompt templates. This is **not an official AML score** and is not directly comparable with the Cycle 2 leaderboard. An AML Smoke and Full run have not yet been performed.
 
-In a separate offline source-citation diagnostic, the span mode with Top 100 covered all annotated source turns in 91 of 99 evaluable questions from the same fixed 100-question selection. That diagnostic imported publicly supplied image captions and search-query text alongside each LoCoMo turn; the official AML input may differ. High citation coverage does not establish answer correctness, and returning 100 spans increases the context substantially.
+In a separate offline source-citation diagnostic, radius-5 spans with Top 100 covered all annotated source turns in 98 of 99 evaluable questions from the same fixed 100-question selection. That diagnostic imported publicly supplied image captions and search-query text alongside each LoCoMo turn; the official AML input may differ. High citation coverage does not establish answer correctness, and returning 100 spans increases the context substantially.
 
 Official evaluation data received through Add or Search must be used only for that evaluation and deleted within 30 days after the run, in accordance with the [official documentation](https://agentmemoryleaderboard.ai/docs).

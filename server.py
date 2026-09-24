@@ -328,9 +328,11 @@ def search_spans(db_path: Path, payload: dict, radius: int = 2,
 
 
 def make_server(host: str, port: int, db_path: Path, api_key: str = "",
-                search_mode: str = "single") -> ThreadingHTTPServer:
+                search_mode: str = "single", span_radius: int = 2) -> ThreadingHTTPServer:
     if search_mode not in ("single", "span"):
         raise ValueError("search_mode must be single or span")
+    if not 0 <= span_radius <= 10:
+        raise ValueError("span_radius must be between 0 and 10")
     initialize(db_path)
 
     class Handler(BaseHTTPRequestHandler):
@@ -374,7 +376,7 @@ def make_server(host: str, port: int, db_path: Path, api_key: str = "",
                 if path == "/add":
                     result = add(db_path, payload)
                 elif search_mode == "span":
-                    result = search_spans(db_path, payload)
+                    result = search_spans(db_path, payload, radius=span_radius)
                 else:
                     result = search(db_path, payload)
                 self.respond(200, result)
@@ -392,9 +394,10 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--db", type=Path, default=Path("state/memory.sqlite3"))
     parser.add_argument("--search-mode", choices=("single", "span"), default="single")
+    parser.add_argument("--span-radius", type=int, default=2)
     args = parser.parse_args()
     server = make_server(args.host, args.port, args.db, os.getenv("MEMORY_SYSTEM_KEY", ""),
-                         args.search_mode)
+                         args.search_mode, args.span_radius)
     print(f"listening on http://{args.host}:{server.server_port}; db={args.db}", flush=True)
     try:
         server.serve_forever()

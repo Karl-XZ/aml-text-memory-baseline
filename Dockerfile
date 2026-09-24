@@ -5,4 +5,4 @@ COPY server.py /app/server.py
 RUN mkdir -p /app/state
 EXPOSE 8000
 VOLUME ["/app/state"]
-CMD ["python", "server.py", "--host", "0.0.0.0", "--port", "8000", "--db", "/app/state/memory.sqlite3"]
+CMD ["python", "server.py", "--host", "0.0.0.0", "--port", "8000", "--db", "/app/state/memory.sqlite3", "--search-mode", "span", "--span-radius", "5"]

@@ -132,6 +132,21 @@ class BaselineTest(unittest.TestCase):
         self.start()
         self.assertEqual(self.request("/search", query)[1], result)
 
+    def test_configured_span_radius_five_keeps_distant_source_turns(self):
+        self.stop()
+        self.server = make_server("127.0.0.1", 0, self.db, "local-secret", "span", 5)
+        self.base = f"http://127.0.0.1:{self.server.server_port}"
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        messages = [{"role": "user", "content": f"ordinary turn {i}"} for i in range(11)]
+        messages[5] = {"role": "user", "content": "unique comet anchor"}
+        self.request("/add", {"request_id": "radius-five", "user_id": "alice",
+                              "session_id": "s", "messages": messages})
+        result = self.request("/search", {"query": "comet anchor",
+                                          "user_id": "alice", "top_k": 1})[1]
+        self.assertIn("ordinary turn 0", result["data"][0]["content"])
+        self.assertIn("ordinary turn 10", result["data"][0]["content"])
+
 
 if __name__ == "__main__":
     unittest.main()
