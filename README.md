@@ -16,7 +16,7 @@ Set `MEMORY_SYSTEM_KEY` to enable authentication on Add and Search. The service 
 
 ## Run locally
 
-Python 3.12 or newer, with SQLite FTS5 enabled, is sufficient. There are no third-party Python dependencies.
+Python 3.12 or newer with SQLite FTS5 trigram support is sufficient. On hosts with an older system SQLite, install the pinned `pysqlite3-binary` package from `requirements-deployment.txt` in an isolated virtual environment; the server automatically uses it when present.
 
 ```sh
 python -m unittest -q test_baseline.py

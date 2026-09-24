@@ -7,7 +7,10 @@ import hashlib
 import json
 import os
 import re
-import sqlite3
+try:
+    import pysqlite3 as sqlite3  # Isolated deployment runtime with modern FTS5 trigram.
+except ImportError:
+    import sqlite3  # Standard Python builds with recent SQLite need no extra package.
 from contextlib import closing
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer

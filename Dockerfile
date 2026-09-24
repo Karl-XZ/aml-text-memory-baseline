@@ -1,6 +1,8 @@
 FROM python:3.12-slim
 
 WORKDIR /app
+COPY requirements-deployment.txt /app/requirements-deployment.txt
+RUN pip install --no-cache-dir -r /app/requirements-deployment.txt
 COPY server.py /app/server.py
 RUN mkdir -p /app/state
 EXPOSE 8000
