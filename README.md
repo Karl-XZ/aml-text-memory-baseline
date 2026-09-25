@@ -1,7 +1,7 @@
 # AML Cycle 2 Textual Add/Search baseline
 
 This `optimize-text-v2` worktree is local development. The submitted
-`v0.1.0-span5-b471760` version passed official Smoke (54.35); Full has not
+`v0.1.0-span5-b471760` version passed official Smoke (private diagnostic 54.35); Full has not
 started. The source-time correction and optional time anchors in this worktree have not been deployed or
 officially scored. See [the 2026-09-25 experiment report](EXPERIMENT_REPORT_20260925_ZH.md).
 
@@ -42,7 +42,7 @@ The implementation was written for this entry and does not copy an existing memo
 
 ## Result scope
 
-The local API contract tests cover Add, Search, isolation, retries, and persistence. A separate local 100-question experiment on the public upstream LoCoMo dataset using radius-5 raw spans reached **67/100** under a DeepSeek Answer/Judge proxy with the published AML prompt templates. In a new paired 21-question temporal subset using `gpt-4o-mini`, the optional time anchors raised local judged accuracy from 13/21 to 14/21. These are **not official AML scores** and are not directly comparable with the Cycle 2 leaderboard. The submitted baseline later passed an official private Smoke at 54.35; no Full run has been performed.
+The local API contract tests cover Add, Search, isolation, retries, and persistence. A separate local 100-question experiment on the public upstream LoCoMo dataset using radius-5 raw spans reached **67/100** under a DeepSeek Answer/Judge proxy with the published AML prompt templates. In a new paired 21-question temporal subset using `gpt-4o-mini`, the optional time anchors raised local judged accuracy from 13/21 to 14/21. These are **not official AML scores** and are not directly comparable with the Cycle 2 leaderboard. The submitted baseline later passed an official private Smoke with diagnostic value 54.35; no Full run has been performed.
 
 In a separate offline source-citation diagnostic, radius-5 spans with Top 100 covered all annotated source turns in 98 of 99 evaluable questions from the same fixed 100-question selection. That diagnostic imported publicly supplied image captions and search-query text alongside each LoCoMo turn; the official AML input may differ. High citation coverage does not establish answer correctness, and returning 100 spans increases the context substantially.
 
