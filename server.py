@@ -12,7 +12,7 @@ try:
 except ImportError:
     import sqlite3  # Standard Python builds with recent SQLite need no extra package.
 from contextlib import closing
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -24,10 +24,95 @@ STOPWORDS = frozenset(
     "were what when where which who why with would you your".split()
 )
 
+TEMPORAL_QUERY = re.compile(
+    r"^(?:when\b|(?:what|which) (?:date|day|month|year|week)\b|"
+    r"how (?:long|many (?:days|weeks|months|years))\b)", re.IGNORECASE
+)
+WEEKDAYS = {name: index for index, name in enumerate(
+    ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"))}
+
 
 def memory_id(request_id: str, index: int) -> str:
     digest = hashlib.sha256(f"{request_id}\0{index}".encode("utf-8")).hexdigest()
     return "mem_" + digest[:24]
+
+
+def evidence_record(identifier: str, content: str, score: float,
+                    stored_at: str) -> dict:
+    """Expose source time only when Add supplied one.
+
+    The baseline stored ingestion time in created_at when the source had no
+    timestamp. Passing that value to Answer made old events look current.
+    """
+    record = {"id": identifier, "content": content, "score": score}
+    if content.startswith("[" + stored_at + "] "):
+        record["created_at"] = stored_at
+    return record
+
+
+def temporal_annotations(content: str, stored_at: str) -> str:
+    """Annotate relative dates only when the Add source timestamp is known."""
+    if not content.startswith("[" + stored_at + "] "):
+        return ""
+    anchor = datetime.fromisoformat(stored_at.replace("Z", "+00:00")).date()
+    lowered = content.casefold()
+    notes = []
+
+    def add_note(phrase: str, value: str) -> None:
+        note = f"{phrase} = {value}"
+        if note not in notes:
+            notes.append(note)
+
+    if re.search(r"\byesterday\b", lowered):
+        add_note("yesterday", (anchor - timedelta(days=1)).isoformat())
+    for match in re.finditer(r"\b(a|one|two|three|\d+) days? ago\b", lowered):
+        word = match.group(1)
+        days = {"a": 1, "one": 1, "two": 2, "three": 3}.get(word)
+        days = int(word) if days is None else days
+        if days <= 31:
+            add_note(match.group(0), (anchor - timedelta(days=days)).isoformat())
+    for match in re.finditer(
+        r"\b(last|next) (monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+        lowered,
+    ):
+        direction, weekday = match.groups()
+        target = WEEKDAYS[weekday]
+        days = ((anchor.weekday() - target) % 7 or 7) if direction == "last" \
+            else ((target - anchor.weekday()) % 7 or 7)
+        date = anchor - timedelta(days=days) if direction == "last" \
+            else anchor + timedelta(days=days)
+        add_note(match.group(0), date.isoformat())
+    if re.search(r"\blast month\b", lowered):
+        month = anchor.month - 1 or 12
+        year = anchor.year - (anchor.month == 1)
+        add_note("last month", f"{year:04d}-{month:02d}")
+    if re.search(r"\blast year\b", lowered):
+        add_note("last year", str(anchor.year - 1))
+    return " [Time anchors at " + anchor.isoformat() + ": " + "; ".join(notes) + "]" if notes else ""
+
+
+def compact_source_turn(content: str, query: str, limit: int = 1200) -> str:
+    """Keep a marked, query-relevant excerpt of an unusually long source turn."""
+    if len(content) <= limit:
+        return content
+    match = re.match(r"(?:\[[^]]+\] )?(?:user|assistant): ", content)
+    header = match.group(0) if match else ""
+    body = content[len(header):]
+    allowance = max(200, limit - len(header) - 2)
+    terms = [word for word in re.findall(r"[^\W_]+", query.casefold())
+             if word not in STOPWORDS and len(word) >= 3]
+    candidates = {0, max(0, len(body) - allowance)}
+    lowered = body.casefold()
+    for term in terms:
+        for found in list(re.finditer(r"\b" + re.escape(term) + r"\b", lowered))[:100]:
+            candidates.add(max(0, min(len(body) - allowance, found.start() - 250)))
+    def score(start: int) -> tuple[int, int, int]:
+        window = lowered[start:start + allowance]
+        return (sum(term in window for term in terms),
+                sum(window.count(term) for term in terms), -start)
+    start = max(candidates, key=score)
+    end = min(len(body), start + allowance)
+    return header + ("…" if start else "") + body[start:end] + ("…" if end < len(body) else "")
 
 
 def open_db(path: Path) -> sqlite3.Connection:
@@ -200,7 +285,8 @@ def search_baseline(db_path: Path, payload: dict) -> dict:
         ).fetchall()
     return {
         "data": [
-            {"id": row["id"], "content": row["content"], "score": float(-row["rank"]), "created_at": row["created_at"]}
+            evidence_record(row["id"], row["content"], float(-row["rank"]),
+                            row["created_at"])
             for row in rows
         ]
     }
@@ -264,14 +350,16 @@ def search(db_path: Path, payload: dict, neighbor_weight: float = 0.35) -> dict:
                     scores[neighbor] = scores.get(neighbor, 0.0) + base * neighbor_weight
     ordered = sorted(scores, key=lambda identifier: (-scores[identifier], lexical_rank.get(identifier, 10**9), identifier))
     return {"data": [
-        {"id": identifier, "content": documents[identifier]["content"],
-         "score": scores[identifier], "created_at": documents[identifier]["created_at"]}
+        evidence_record(identifier, documents[identifier]["content"],
+                        scores[identifier], documents[identifier]["created_at"])
         for identifier in ordered[:payload["top_k"]]
     ]}
 
 
 def search_spans(db_path: Path, payload: dict, radius: int = 2,
-                 include_source_ids: bool = False) -> dict:
+                 include_source_ids: bool = False,
+                 time_anchors: bool = False,
+                 compact_long_context: bool = False) -> dict:
     """Expand lexical hits into ranked source spans, without generating answers."""
     validate_search(payload)
     candidates = search(db_path, {**payload, "top_k": max(payload["top_k"] * 3, 300)})["data"]
@@ -304,6 +392,7 @@ def search_spans(db_path: Path, payload: dict, radius: int = 2,
                 surrounding[row["position"]] = row
     used_centers = set()
     results = []
+    raw_chars_first_ten = 0
     for candidate in candidates:
         center = centers.get(candidate["id"])
         if center is None or candidate["id"] in used_centers:
@@ -318,20 +407,47 @@ def search_spans(db_path: Path, payload: dict, radius: int = 2,
         source_ids = [row["id"] for row in span]
         used_centers.update(source_ids)
         span_id = "span_" + hashlib.sha256("\0".join(source_ids).encode()).hexdigest()[:24]
+        use_anchors = time_anchors and bool(TEMPORAL_QUERY.search(payload["query"]))
+        source_lines = [row["content"] + (
+            temporal_annotations(row["content"], row["created_at"]) if use_anchors else "")
+            for row in span]
+        if compact_long_context and len(results) < 10:
+            raw_chars_first_ten += sum(map(len, source_lines))
         result = {"id": span_id,
-                  "content": "\n".join(row["content"] for row in span),
-                  "score": candidate["score"],
-                  "created_at": candidate["created_at"]}
+                  "content": "\n".join(source_lines),
+                  "score": candidate["score"]}
+        if compact_long_context:
+            result["_source_lines"] = source_lines
+        if "created_at" in candidate:
+            result["created_at"] = candidate["created_at"]
         if include_source_ids:
             result["_source_ids"] = source_ids
         results.append(result)
         if len(results) >= payload["top_k"]:
             break
+    if compact_long_context and raw_chars_first_ten > 50_000:
+        used_chars = 0
+        compacted = []
+        for result in results:
+            # Preserve the original source IDs and raw turn ordering. The
+            # visible excerpt is marked; no generated answer is inserted.
+            text = "\n".join(compact_source_turn(line, payload["query"])
+                             for line in result["_source_lines"])
+            if compacted and used_chars + len(text) > 110_000:
+                break
+            compacted.append({key: value for key, value in result.items()
+                              if key != "_source_lines"} | {"content": text})
+            used_chars += len(text)
+        results = compacted
+    elif compact_long_context:
+        for result in results:
+            del result["_source_lines"]
     return {"data": results}
 
 
 def make_server(host: str, port: int, db_path: Path, api_key: str = "",
-                search_mode: str = "single", span_radius: int = 2) -> ThreadingHTTPServer:
+                search_mode: str = "single", span_radius: int = 2,
+                time_anchors: bool = False) -> ThreadingHTTPServer:
     if search_mode not in ("single", "span"):
         raise ValueError("search_mode must be single or span")
     if not 0 <= span_radius <= 10:
@@ -379,7 +495,8 @@ def make_server(host: str, port: int, db_path: Path, api_key: str = "",
                 if path == "/add":
                     result = add(db_path, payload)
                 elif search_mode == "span":
-                    result = search_spans(db_path, payload, radius=span_radius)
+                    result = search_spans(db_path, payload, radius=span_radius,
+                                          time_anchors=time_anchors)
                 else:
                     result = search(db_path, payload)
                 self.respond(200, result)
@@ -398,9 +515,10 @@ def main() -> None:
     parser.add_argument("--db", type=Path, default=Path("state/memory.sqlite3"))
     parser.add_argument("--search-mode", choices=("single", "span"), default="single")
     parser.add_argument("--span-radius", type=int, default=2)
+    parser.add_argument("--time-anchors", action="store_true")
     args = parser.parse_args()
     server = make_server(args.host, args.port, args.db, os.getenv("MEMORY_SYSTEM_KEY", ""),
-                         args.search_mode, args.span_radius)
+                         args.search_mode, args.span_radius, args.time_anchors)
     print(f"listening on http://{args.host}:{server.server_port}; db={args.db}", flush=True)
     try:
         server.serve_forever()

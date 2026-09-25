@@ -3,3 +3,11 @@ __pycache__/
 *.pyc
 .env
 *.sqlite3*
+public_data/
+*.partial.jsonl
+baseline_*_gptmini.json
+packet_*_gptmini.json
+public100_*.json
+public_all_*.json
+v2_time_*.json
+lme_*.json
