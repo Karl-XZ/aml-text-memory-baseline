@@ -146,6 +146,7 @@ def initialize(path: Path) -> None:
                 FOREIGN KEY(request_id) REFERENCES requests(request_id)
             );
             CREATE INDEX IF NOT EXISTS memories_user ON memories(user_id);
+            CREATE INDEX IF NOT EXISTS memories_user_session ON memories(user_id, session_id);
             CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
                 id UNINDEXED, content, tokenize='porter unicode61'
             );
@@ -268,6 +269,26 @@ def trigram_query(query: str) -> str:
     return " OR ".join('"' + gram + '"' for gram in grams[:64])
 
 
+def session_context(db: sqlite3.Connection, user_id: str,
+                    session_ids: set[str]) -> tuple[dict, dict]:
+    """Use source-session order even when concurrent Add batches interleave."""
+    sessions = {}
+    locations = {}
+    values = sorted(session_ids)
+    for start in range(0, len(values), 400):
+        chunk = values[start:start + 400]
+        marks = ",".join("?" for _ in chunk)
+        for row in db.execute(
+            f"SELECT rowid AS position, id, session_id, content, created_at "
+            f"FROM memories WHERE user_id=? AND session_id IN ({marks}) ORDER BY rowid",
+            (user_id, *chunk),
+        ):
+            group = sessions.setdefault(row["session_id"], [])
+            locations[row["id"]] = (row["session_id"], len(group))
+            group.append(row)
+    return sessions, locations
+
+
 def search_baseline(db_path: Path, payload: dict) -> dict:
     payload = validate_search(payload)
     expression = fts_query(payload["query"])
@@ -323,18 +344,9 @@ def search(db_path: Path, payload: dict, neighbor_weight: float = 0.35) -> dict:
         candidates = [hit for ranking in rankings for hit in ranking]
         if not candidates:
             return {"data": []}
-        positions = sorted({hit["position"] + offset for hit in candidates for offset in (-1, 0, 1) if hit["position"] + offset > 0})
-        rows = []
-        for start in range(0, len(positions), 500):
-            batch = positions[start:start + 500]
-            placeholders = ",".join("?" for _ in batch)
-            rows.extend(db.execute(
-                f"SELECT rowid AS position, id, session_id, content, created_at "
-                f"FROM memories WHERE user_id=? AND rowid IN ({placeholders})",
-                (payload["user_id"], *batch),
-            ).fetchall())
-    documents = {row["id"]: row for row in rows}
-    by_position = {row["position"]: row for row in rows}
+        sessions, locations = session_context(
+            db, payload["user_id"], {hit["session_id"] for hit in candidates})
+    documents = {row["id"]: row for group in sessions.values() for row in group}
     scores = {}
     lexical_rank = {}
     for ranking in rankings:
@@ -343,9 +355,11 @@ def search(db_path: Path, payload: dict, neighbor_weight: float = 0.35) -> dict:
             lexical_rank[identifier] = min(rank, lexical_rank.get(identifier, 10**9))
             base = 1.0 / (20.0 + rank)
             scores[identifier] = scores.get(identifier, 0.0) + base
+            session_id, position = locations[identifier]
+            group = sessions[session_id]
             for offset in (-1, 1):
-                adjacent = by_position.get(hit["position"] + offset)
-                if adjacent is not None and adjacent["session_id"] == hit["session_id"]:
+                adjacent = group[position + offset] if 0 <= position + offset < len(group) else None
+                if adjacent is not None:
                     neighbor = adjacent["id"]
                     scores[neighbor] = scores.get(neighbor, 0.0) + base * neighbor_weight
     ordered = sorted(scores, key=lambda identifier: (-scores[identifier], lexical_rank.get(identifier, 10**9), identifier))
@@ -376,20 +390,8 @@ def search_spans(db_path: Path, payload: dict, radius: int = 2,
                 f"WHERE user_id=? AND id IN ({marks})", (payload["user_id"], *chunk)
             ):
                 centers[row["id"]] = row
-        positions = sorted({centers[item["id"]]["position"] + offset
-                            for item in candidates if item["id"] in centers
-                            for offset in range(-radius, radius + 1)
-                            if centers[item["id"]]["position"] + offset > 0})
-        surrounding = {}
-        for start in range(0, len(positions), 500):
-            chunk = positions[start:start + 500]
-            marks = ",".join("?" for _ in chunk)
-            for row in db.execute(
-                f"SELECT rowid AS position, id, session_id, content, created_at "
-                f"FROM memories WHERE user_id=? AND rowid IN ({marks})",
-                (payload["user_id"], *chunk),
-            ):
-                surrounding[row["position"]] = row
+        sessions, locations = session_context(
+            db, payload["user_id"], {row["session_id"] for row in centers.values()})
     used_centers = set()
     results = []
     raw_chars_first_ten = 0
@@ -397,11 +399,8 @@ def search_spans(db_path: Path, payload: dict, radius: int = 2,
         center = centers.get(candidate["id"])
         if center is None or candidate["id"] in used_centers:
             continue
-        span = [surrounding[position]
-                for position in range(center["position"] - radius,
-                                      center["position"] + radius + 1)
-                if position in surrounding
-                and surrounding[position]["session_id"] == center["session_id"]]
+        session_id, position = locations[candidate["id"]]
+        span = sessions[session_id][max(0, position - radius):position + radius + 1]
         if not span:
             continue
         source_ids = [row["id"] for row in span]

@@ -68,6 +68,20 @@ class RetrievalV2Test(unittest.TestCase):
                                        radius=0, time_anchors=True)["data"]
         self.assertFalse(any("Time anchors" in item["content"] for item in ordinary))
 
+    def test_interleaved_add_batches_keep_session_neighbors(self):
+        for index in range(11):
+            for session in ("target", "noise"):
+                content = ("unique comet blue violin" if session == "target" and index == 5
+                           else f"{session} turn {index}")
+                server.add(self.db, {"request_id": f"{session}-{index}", "user_id": "alice",
+                                     "session_id": session,
+                                     "messages": [{"role": "user", "content": content}]})
+        result = server.search_spans(self.db, {"query": "unique comet", "user_id": "alice",
+                                               "top_k": 1}, radius=5)["data"][0]
+        self.assertIn("target turn 0", result["content"])
+        self.assertIn("target turn 10", result["content"])
+        self.assertNotIn("noise turn", result["content"])
+
 
 if __name__ == "__main__":
     unittest.main()
